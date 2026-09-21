@@ -1,0 +1,72 @@
+name: auto-update offsets
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build cs2-dumper
+        run: cargo build --release
+        continue-on-error: true
+
+      - name: Run dumper
+        run: |
+          if (Test-Path ".\target\release\cs2-dumper.exe") {
+            .\target\release\cs2-dumper.exe --output json > offsets_raw.json
+          } else {
+            "{}" | Out-File -Encoding utf8 offsets_raw.json
+          }
+        shell: pwsh
+
+      - name: Convert to loader format
+        run: |
+          python -c "
+          import json
+          try:
+              raw = json.load(open('offsets_raw.json'))
+          except:
+              raw = {}
+          out = {}
+          src = raw.get('client.dll', raw) if isinstance(raw, dict) else {}
+          for k, v in src.items():
+              if isinstance(v, int):
+                  out[k] = hex(v)
+              elif isinstance(v, str):
+                  out[k] = v
+          json.dump(out, open('offsets.json','w'), indent=2)
+          print('entries:', len(out))
+          "
+
+      - name: Commit to repo
+        run: |
+          git config user.name "auto-offsets-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add offsets.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "auto offsets $(Get-Date -Format o)"
+            git push
+          }
+        shell: pwsh
+
+      - name: Update gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          $content = Get-Content offsets.json -Raw
+          $body = @{ files = @{ "offsets.json" = @{ content = $content } } } | ConvertTo-Json -Depth 5
+          $body | Out-File -Encoding utf8 body.json
+          gh api -X PATCH /gists/$env:GIST_ID --input body.json
+        shell: pwsh

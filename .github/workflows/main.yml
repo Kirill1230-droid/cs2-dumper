@@ -2,71 +2,69 @@ name: auto-update offsets
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
   dump:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build cs2-dumper
-        run: cargo build --release
-        continue-on-error: true
-
-      - name: Run dumper
+      - name: Download offsets from a2x/cs2-dumper
         run: |
-          if (Test-Path ".\target\release\cs2-dumper.exe") {
-            .\target\release\cs2-dumper.exe --output json > offsets_raw.json
-          } else {
-            "{}" | Out-File -Encoding utf8 offsets_raw.json
-          }
-        shell: pwsh
+          curl -fsSL -o client_dll.hpp \
+            "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.hpp" || echo "client_dll.hpp failed"
+          curl -fsSL -o offsets.hpp \
+            "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.hpp" || echo "offsets.hpp failed"
+          ls -la *.hpp
+          echo "--- first lines of client_dll.hpp ---"
+          head -20 client_dll.hpp || true
 
-      - name: Convert to loader format
+      - name: Convert hpp to json
         run: |
-          python -c "
-          import json
-          try:
-              raw = json.load(open('offsets_raw.json'))
-          except:
-              raw = {}
+          python3 << 'PYEOF'
+          import re, json, os
+
           out = {}
-          src = raw.get('client.dll', raw) if isinstance(raw, dict) else {}
-          for k, v in src.items():
-              if isinstance(v, int):
-                  out[k] = hex(v)
-              elif isinstance(v, str):
-                  out[k] = v
+
+          for fname in ['client_dll.hpp', 'offsets.hpp']:
+              if not os.path.exists(fname):
+                  continue
+              text = open(fname).read()
+              for m in re.finditer(r'constexpr\s+std::uintptr_t\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+)', text):
+                  out[m.group(1)] = m.group(2).lower()
+
           json.dump(out, open('offsets.json','w'), indent=2)
-          print('entries:', len(out))
-          "
+          print(f'[+] saved {len(out)} offsets')
+          if out:
+              print('--- keys ---')
+              print('\n'.join(list(out.keys())[:20]))
+          PYEOF
 
       - name: Commit to repo
         run: |
           git config user.name "auto-offsets-bot"
           git config user.email "bot@users.noreply.github.com"
           git add offsets.json
-          git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "auto offsets $(Get-Date -Format o)"
+          if ! git diff --cached --quiet; then
+            git commit -m "auto offsets $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             git push
-          }
-        shell: pwsh
+          else
+            echo "no changes"
+          fi
 
       - name: Update gist
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          $content = Get-Content offsets.json -Raw
-          $body = @{ files = @{ "offsets.json" = @{ content = $content } } } | ConvertTo-Json -Depth 5
-          $body | Out-File -Encoding utf8 body.json
-          gh api -X PATCH /gists/$env:GIST_ID --input body.json
-        shell: pwsh
+          if [ -n "$GH_TOKEN" ] && [ -n "$GIST_ID" ]; then
+            jq -Rs '{files:{("offsets.json"):{content:.}}}' offsets.json > body.json
+            gh api -X PATCH /gists/$GIST_ID --input body.json
+            echo "[+] gist updated"
+          else
+            echo "[!] no GIST_TOKEN or GIST_ID, skipping"
+          fi
